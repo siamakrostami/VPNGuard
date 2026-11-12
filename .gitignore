@@ -1,0 +1,40 @@
+# Swift/Xcode generated state
+/.build/
+/.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.DS_Store
+
+# Generated apps, archives and local release output
+/dist/
+*.app/
+*.dSYM/
+*.zip
+*.tar.gz
+*.log
+
+# Private local history, diagnostics and the retired v1 helper
+/Previous/
+/docs/*
+!/docs/public/
+/Emergency Recovery.command
+/Legacy Recovery.command
+
+# Runtime data and local signing configuration
+/Backups/
+/Sessions/
+/rules.json
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+*.cer
+*.key
+.env
+.env.*
+*.local
+
+# Python audit-script caches
+__pycache__/
+*.py[cod]
