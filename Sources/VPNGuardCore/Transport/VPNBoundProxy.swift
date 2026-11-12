@@ -9,21 +9,29 @@ public struct ProxySessionInfo: Sendable {
 
 enum BoundSocket {
     static func make(path: GenericVPNPath) throws -> Int32 {
-        guard NetworkParsing.routeInterface("interface: " + path.interface) != nil,
+        guard path.proxy == nil, RoutedTunnelDiscovery.isTunnelInterface(path.interface),
               path.interfaceIndex > 0, if_nametoindex(path.interface) == path.interfaceIndex,
-              IPv4.isValid(path.address), !path.address.hasPrefix("127."), path.address != "0.0.0.0" else {
+              (path.isIPv6 ? IPv6.isValid(path.address) && path.address != "::" && path.address != "::1" : IPv4.isValid(path.address) && !path.address.hasPrefix("127.") && path.address != "0.0.0.0") else {
             throw GuardError.invalid("The verified VPN interface no longer exists.")
         }
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        let fd = socket(path.isIPv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw GuardError.invalid("Cannot create a VPN socket.") }
         do {
             var index = path.interfaceIndex
-            guard setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, socklen_t(MemoryLayout.size(ofValue: index))) == 0 else {
-                throw GuardError.invalid("Cannot restrict the socket to the VPN interface.")
+            let level = path.isIPv6 ? IPPROTO_IPV6 : IPPROTO_IP
+            let option = path.isIPv6 ? IPV6_BOUND_IF : IP_BOUND_IF
+            guard setsockopt(fd, level, option, &index, socklen_t(MemoryLayout.size(ofValue: index))) == 0 else {
+                throw GuardError.invalid("Cannot restrict the socket to the selected tunnel interface.")
             }
-            var source = address(path.address, port: 0)
-            let result = withUnsafePointer(to: &source) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
-            guard result == 0 else { throw GuardError.invalid("Cannot bind the socket to the VPN source address.") }
+            let result: Int32
+            if path.isIPv6 {
+                var source = address6(path.address, port: 0)
+                result = withUnsafePointer(to: &source) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) } }
+            } else {
+                var source = address(path.address, port: 0)
+                result = withUnsafePointer(to: &source) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+            }
+            guard result == 0 else { throw GuardError.invalid("Cannot bind the socket to the tunnel source address.") }
             configure(fd)
             return fd
         } catch { close(fd); throw error }
@@ -32,6 +40,12 @@ enum BoundSocket {
         var result = sockaddr_in(); result.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         result.sin_family = sa_family_t(AF_INET); result.sin_port = port.bigEndian
         _ = ip.withCString { inet_pton(AF_INET, $0, &result.sin_addr) }
+        return result
+    }
+    static func address6(_ ip: String, port: UInt16) -> sockaddr_in6 {
+        var result = sockaddr_in6(); result.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        result.sin6_family = sa_family_t(AF_INET6); result.sin6_port = port.bigEndian
+        _ = ip.withCString { inet_pton(AF_INET6, $0, &result.sin6_addr) }
         return result
     }
     static func configure(_ fd: Int32) {
@@ -46,8 +60,14 @@ enum BoundSocket {
         let flags = fcntl(fd, F_GETFL)
         guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else { throw GuardError.invalid("Cannot configure the VPN connection.") }
         defer { _ = fcntl(fd, F_SETFL, flags) }
-        var target = address(ip, port: port)
-        let status = withUnsafePointer(to: &target) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        let status: Int32
+        if ip.contains(":") {
+            var target = address6(ip, port: port)
+            status = withUnsafePointer(to: &target) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) } }
+        } else {
+            var target = address(ip, port: port)
+            status = withUnsafePointer(to: &target) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        }
         guard status == 0 || errno == EINPROGRESS else { throw GuardError.invalid("VPN connection failed.") }
         if status != 0 {
             var p = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
@@ -254,31 +274,63 @@ public final class VPNBoundProxy: @unchecked Sendable {
             guard valid(epoch), try monitor.inspect() == snapshot.path else {
                 pause(expected: epoch, message: "VPN connection changed. Connections blocked; waiting to reverify."); return
             }
-            let addresses = try monitor.resolve(request.host, path: snapshot.path)
-            guard valid(epoch), let address = addresses.first else { return }
-            let upstream = try BoundSocket.make(path: snapshot.path)
-            guard register(upstream, generation: epoch) else { close(upstream); return }
-            defer { release(upstream) }
-            try BoundSocket.connect(upstream, address: address, port: request.port)
+            let channel: PayloadChannel
+            if let endpoint = snapshot.path.proxy {
+                channel = .proxy(try UpstreamProxyChannel(endpoint: endpoint, host: request.host, port: request.port))
+                guard register(channel.descriptor, generation: epoch) else { channel.close(); return }
+            } else {
+                let addresses = try monitor.resolve(request.host, path: snapshot.path)
+                guard valid(epoch), let address = addresses.first else { return }
+                let fd = try BoundSocket.make(path: snapshot.path)
+                channel = .routed(fd)
+                guard register(fd, generation: epoch) else { channel.close(); return }
+                do { try BoundSocket.connect(fd, address: address, port: request.port) }
+                catch { locked { sockets.remove(fd) }; channel.close(); throw error }
+            }
+            defer { locked { sockets.remove(channel.descriptor) }; channel.close() }
             guard valid(epoch), BoundSocket.sendAll(client, Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8)) else { return }
-            relay(client, upstream, generation: epoch)
+            relay(client, channel, generation: epoch)
         } catch {
             _ = BoundSocket.sendAll(client, Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
         }
     }
-    private func relay(_ client: Int32, _ upstream: Int32, generation epoch: UInt64) {
+    private func relay(_ client: Int32, _ upstream: PayloadChannel, generation epoch: UInt64) {
         var lastData = Date()
         var buffer = [UInt8](repeating: 0, count: 16384)
         while valid(epoch) && Date().timeIntervalSince(lastData) < 120 {
-            var descriptors = [pollfd(fd: client, events: Int16(POLLIN), revents: 0), pollfd(fd: upstream, events: Int16(POLLIN), revents: 0)]
-            let count = poll(&descriptors, 2, 500)
-            if count < 0 { if errno == EINTR { continue }; return }
-            for i in 0..<2 where descriptors[i].revents != 0 {
-                guard descriptors[i].revents & Int16(POLLIN) != 0 else { return }
-                let received = recv(descriptors[i].fd, &buffer, buffer.count, 0)
-                guard received > 0, valid(epoch), BoundSocket.sendAll(descriptors[1-i].fd, Data(buffer.prefix(received))) else { return }
+            // Drain libcurl's TLS buffers before polling its underlying socket.
+            let incoming = buffer.withUnsafeMutableBytes { upstream.receive($0.baseAddress!, capacity: $0.count) }
+            if incoming == 0 || incoming == -1 { return }
+            if incoming > 0 {
+                guard valid(epoch), BoundSocket.sendAll(client, Data(buffer.prefix(incoming))) else { return }
                 lastData = Date()
             }
+            let outgoing = recv(client, &buffer, buffer.count, MSG_DONTWAIT)
+            if outgoing == 0 { return }
+            if outgoing < 0 && ![EINTR, EAGAIN, EWOULDBLOCK].contains(errno) { return }
+            if outgoing > 0 {
+                guard valid(epoch), upstream.sendAll(Data(buffer.prefix(outgoing))) else { return }
+                lastData = Date()
+            }
+            if incoming < 0 && outgoing < 0 {
+                var descriptors = [pollfd(fd: client, events: Int16(POLLIN), revents: 0), pollfd(fd: upstream.descriptor, events: Int16(POLLIN), revents: 0)]
+                if poll(&descriptors, 2, 250) < 0 && errno != EINTR { return }
+            }
+        }
+    }
+}
+
+private enum PayloadChannel {
+    case routed(Int32), proxy(UpstreamProxyChannel)
+    var descriptor: Int32 { switch self { case .routed(let fd): fd; case .proxy(let channel): channel.descriptor } }
+    func close() { switch self { case .routed(let fd): Darwin.close(fd); case .proxy(let channel): channel.close() } }
+    func sendAll(_ data: Data) -> Bool { switch self { case .routed(let fd): BoundSocket.sendAll(fd, data); case .proxy(let channel): channel.sendAll(data) } }
+    func receive(_ buffer: UnsafeMutableRawPointer, capacity: Int) -> Int {
+        switch self {
+        case .proxy(let channel): return channel.receive(buffer, capacity: capacity)
+        case .routed(let fd):
+            let n = recv(fd, buffer, capacity, MSG_DONTWAIT)
+            return n < 0 && [EAGAIN, EWOULDBLOCK, EINTR].contains(errno) ? -2 : n
         }
     }
 }

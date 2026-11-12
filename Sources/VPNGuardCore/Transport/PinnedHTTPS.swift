@@ -6,7 +6,7 @@ import Darwin
 /// Neither curl nor the bridge resolves DNS or tries an alternative destination.
 enum PinnedHTTPS {
     static func fetch(path: GenericVPNPath, host: String, address: String, resource: String) throws -> String {
-        guard IPv4.isPublic(address), DNSHostname.isValid(host), resource.hasPrefix("/"),
+        guard path.proxy == nil, (path.isIPv6 ? IPv6.isPublic(address) : IPv4.isPublic(address)), DNSHostname.isValid(host), resource.hasPrefix("/"),
               !resource.contains(where: { $0.isWhitespace || $0.asciiValue == nil }) else {
             throw GuardError.invalid("Invalid pinned HTTPS endpoint.")
         }
