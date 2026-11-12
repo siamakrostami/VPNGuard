@@ -7,10 +7,14 @@ final class SessionJournal: @unchecked Sendable {
     private let lock = NSLock()
     private var record: GuardSessionRecord
     private let url: URL
+    private let storeURL: URL
+    private var resetHandler: (@Sendable () -> Void)?
     private var timer: DispatchSourceTimer?
 
     init(rule: ProtectedItem, storeURL: URL) throws {
+        self.storeURL = storeURL
         record = GuardSessionRecord(ruleID: rule.id, name: rule.name, phase: "checking", message: "Checking VPN route and non-Iran exit.")
+        record.supportsConnectionReset = true
         let folder = storeURL.deletingLastPathComponent().appendingPathComponent("Sessions", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         url = folder.appendingPathComponent(record.id.uuidString + ".json")
@@ -21,15 +25,22 @@ final class SessionJournal: @unchecked Sendable {
         self.timer = timer; timer.resume()
     }
     deinit { timer?.cancel() }
+    func setResetHandler(_ handler: @escaping @Sendable () -> Void) {
+        lock.lock(); resetHandler = handler; lock.unlock()
+    }
     func update(phase: String, message: String) {
         lock.lock(); defer { lock.unlock() }
+        guard record.phase != "ended" else { return }
         record.phase = phase; record.message = message; record.updatedAt = Date()
         try? save()
         if phase == "ended" { timer?.cancel(); timer = nil }
     }
     private func heartbeat() {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         record.updatedAt = Date(); try? save()
+        let handler = resetHandler, id = record.id, ended = record.phase == "ended"
+        lock.unlock()
+        if !ended, let handler, SessionConnectionReset.consume(sessionID: id, storeURL: storeURL) { handler() }
     }
     private func save() throws {
         let data = try JSONEncoder().encode(record)

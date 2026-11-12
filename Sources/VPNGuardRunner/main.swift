@@ -145,9 +145,16 @@ private func main() throws -> Int32 {
         let verification = try monitor.verify()
         let proxy = VPNBoundProxy(verification: verification, monitor: monitor, onEvent: { message in
             writeError(message)
-            journal.update(phase: "blocked", message: "VPN verification was lost. Proxy connections closed; protected child sockets remain restricted.")
+        }, onStateChange: { state in
+            switch state {
+            case .blocked:
+                journal.update(phase: "blocked", message: "Connections blocked. Reconnect the VPN or choose Reset connections. This session will reverify automatically.")
+            case .running:
+                journal.update(phase: "running", message: "VPN reverified. Retry your last prompt in the existing terminal; direct connections remain restricted.")
+            }
         })
         let info = try proxy.start()
+        journal.setResetHandler { [weak proxy] in proxy?.resetConnections() }
         defer { proxy.stop() }
         let arguments = try SandboxLaunch.arguments(executable: executable, forwarded: invocation.arguments, proxyPort: info.port)
         journal.update(phase: "running", message: "Guarded launch active. Direct child sockets are restricted to its private proxy.")
