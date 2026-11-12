@@ -71,11 +71,85 @@ final class TransportTests: XCTestCase {
         XCTAssertEqual(exit.country, verification.exit.country)
         let unauthorized = try CommandRunner.run("/usr/bin/curl", ["--disable", "--proxy", "http://127.0.0.1:\(info.port)", "--noproxy", "", "--silent", "--max-time", "2", "https://www.cloudflare.com/"], timeout: 3)
         XCTAssertNotEqual(unauthorized.status, 0)
+        proxy.resetConnections()
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline && (try? proxyResponse(port: info.port)) != "HTTP/1.1 407 Proxy Authentication Required" {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        let recovered = try CommandRunner.run("/usr/bin/curl", ["--disable", "--proxy", info.proxyURL, "--noproxy", "", "--fail", "--silent", "--show-error", "--max-time", "15", "https://www.cloudflare.com/cdn-cgi/trace"], timeout: 17)
+        XCTAssertEqual(recovered.status, 0, recovered.stderr)
+        XCTAssertNotEqual(try ExitObservation.parse(recovered.stdout, at: Date()).country, "IR")
         proxy.stop()
         let denied = try CommandRunner.run("/usr/bin/curl", ["--disable", "--proxy", info.proxyURL, "--noproxy", "", "--silent", "--max-time", "2", "https://www.cloudflare.com/"], timeout: 3)
         XCTAssertNotEqual(denied.status, 0)
         print("Live transport verified: \(verification.path.interface), non-Iran country \(verification.exit.country); dual binding, DoH, CONNECT and stop denial passed.")
     }
+    func testOutageRecoveryKeepsTheExistingProxyEndpoint() throws {
+        let monitor = RecoveringTransportMonitor()
+        let proxy = VPNBoundProxy(verification: try monitor.verify(), monitoring: monitor, onEvent: { _ in })
+        let info = try proxy.start(); defer { proxy.stop() }
+        monitor.setAvailable(false)
+        Thread.sleep(forTimeInterval: 1.4)
+        XCTAssertEqual(try proxyResponse(port: info.port), "HTTP/1.1 503 Service Unavailable")
+        monitor.setPath(GenericVPNPath(interface: "utun9998", address: "10.8.0.2", interfaceIndex: 9998))
+        monitor.setAvailable(true)
+        let deadline = Date().addingTimeInterval(8)
+        var response = ""
+        repeat {
+            response = (try? proxyResponse(port: info.port)) ?? "closed"
+            if response == "HTTP/1.1 407 Proxy Authentication Required" { break }
+            Thread.sleep(forTimeInterval: 0.1)
+        } while Date() < deadline
+        XCTAssertEqual(response, "HTTP/1.1 407 Proxy Authentication Required", "Existing CLI proxy endpoint must recover without a new process")
+        XCTAssertEqual(try proxyResponse(port: info.port, proxyURL: info.proxyURL), "HTTP/1.1 502 Bad Gateway", "Original credentials must reach resolution using the new verified path")
+    }
+
+    func testResetClosesOldSocketsAndRejectsIranExitBeforeRecovering() throws {
+        let monitor = RecoveringTransportMonitor(delayResolve: true)
+        defer { monitor.releaseResolve.signal() }
+        let proxy = VPNBoundProxy(verification: try monitor.verify(), monitoring: monitor, onEvent: { _ in })
+        let info = try proxy.start(); defer { proxy.stop() }
+        let client = socket(AF_INET, SOCK_STREAM, 0); defer { close(client) }
+        BoundSocket.configure(client)
+        try BoundSocket.connect(client, address: "127.0.0.1", port: info.port)
+        let url = try XCTUnwrap(URLComponents(string: info.proxyURL))
+        let auth = Data((try XCTUnwrap(url.user) + ":" + (try XCTUnwrap(url.password))).utf8).base64EncodedString()
+        XCTAssertTrue(BoundSocket.sendAll(client, Data(("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic " + auth + "\r\n\r\n").utf8)))
+        XCTAssertEqual(monitor.resolveEntered.wait(timeout: .now() + 3), .success)
+        monitor.setCountry("IR")
+        proxy.resetConnections()
+        var byte: UInt8 = 0
+        XCTAssertEqual(recv(client, &byte, 1, 0), 0)
+        Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertEqual(try proxyResponse(port: info.port), "HTTP/1.1 503 Service Unavailable")
+        monitor.setCountry("DE")
+        proxy.resetConnections()
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline && (try? proxyResponse(port: info.port)) != "HTTP/1.1 407 Proxy Authentication Required" {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTAssertEqual(try proxyResponse(port: info.port), "HTTP/1.1 407 Proxy Authentication Required")
+        // Original credentials still authorize requests (DNS deliberately fails in this test).
+        XCTAssertEqual(try proxyResponse(port: info.port, proxyURL: info.proxyURL), "HTTP/1.1 502 Bad Gateway")
+        proxy.stop(); proxy.resetConnections()
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertThrowsError(try proxyResponse(port: info.port))
+    }
+
+    func testVerificationFromBeforeAnotherResetCannotRestoreConnections() throws {
+        let monitor = DelayedRecoveryMonitor()
+        let now = Date()
+        let initial = VPNVerification(path: monitor.path, exit: try ExitObservation.parse("ip=1.2.3.4\nloc=DE\n", at: now), verifiedAt: now)
+        let proxy = VPNBoundProxy(verification: initial, monitoring: monitor, onEvent: { _ in })
+        let info = try proxy.start(); defer { proxy.stop(); monitor.release.signal() }
+        proxy.resetConnections()
+        XCTAssertEqual(monitor.entered.wait(timeout: .now() + 3), .success)
+        proxy.resetConnections() // Invalidates the outstanding successful verification.
+        monitor.release.signal()
+        XCTAssertEqual(monitor.retried.wait(timeout: .now() + 3), .success)
+        XCTAssertEqual(try proxyResponse(port: info.port), "HTTP/1.1 503 Service Unavailable")
+    }
+
     func testTopologyLossClosesAcceptedConnectionWithoutChangingNetwork() throws {
         let path = GenericVPNPath(interface: "utun9999", address: "10.0.0.2", interfaceIndex: 9999)
         let now = Date()
@@ -90,8 +164,7 @@ final class TransportTests: XCTestCase {
         Thread.sleep(forTimeInterval: 2)
         var byte: UInt8 = 0
         XCTAssertEqual(recv(client, &byte, 1, 0), 0)
-        let later = socket(AF_INET, SOCK_STREAM, 0); defer { close(later) }
-        XCTAssertThrowsError(try BoundSocket.connect(later, address: "127.0.0.1", port: info.port))
+        XCTAssertEqual(try proxyResponse(port: info.port), "HTTP/1.1 503 Service Unavailable")
     }
     func testExpiryWatchdogClosesConnectionWhileVerifierIsStalled() throws {
         let path = GenericVPNPath(interface: "utun9999", address: "10.0.0.2", interfaceIndex: 9999)
@@ -141,4 +214,62 @@ private struct StalledTransportMonitor: VPNPathMonitoring {
     func inspect() throws -> GenericVPNPath { path }
     func verify() throws -> VPNVerification { Thread.sleep(forTimeInterval: 4); throw GuardError.invalid("Stalled verification") }
     func resolve(_ host: String, path: GenericVPNPath) throws -> [String] { throw GuardError.invalid("No test DNS") }
+}
+
+private func proxyResponse(port: UInt16, proxyURL: String? = nil) throws -> String {
+    let fd = socket(AF_INET, SOCK_STREAM, 0); defer { close(fd) }
+    BoundSocket.configure(fd)
+    try BoundSocket.connect(fd, address: "127.0.0.1", port: port)
+    var auth = ""
+    if let proxyURL, let url = URLComponents(string: proxyURL), let user = url.user, let password = url.password {
+        auth = "Proxy-Authorization: Basic " + Data((user + ":" + password).utf8).base64EncodedString() + "\r\n"
+    }
+    guard BoundSocket.sendAll(fd, Data(("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n" + auth + "\r\n").utf8)) else { return "closed" }
+    var data = [UInt8](repeating: 0, count: 2048)
+    let n = recv(fd, &data, data.count, 0)
+    guard n > 0 else { return "closed" }
+    return String(decoding: data.prefix(n), as: UTF8.self).components(separatedBy: "\r\n")[0]
+}
+
+private final class RecoveringTransportMonitor: VPNPathMonitoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var available = true
+    private var country = "DE"
+    private let delayResolve: Bool
+    let resolveEntered = DispatchSemaphore(value: 0), releaseResolve = DispatchSemaphore(value: 0)
+    init(delayResolve: Bool = false) { self.delayResolve = delayResolve }
+    private var currentPath = GenericVPNPath(interface: "utun9999", address: "10.0.0.2", interfaceIndex: 9999)
+    func setPath(_ path: GenericVPNPath) { lock.lock(); currentPath = path; lock.unlock() }
+    func setCountry(_ value: String) { lock.lock(); country = value; lock.unlock() }
+    func setAvailable(_ value: Bool) { lock.lock(); available = value; lock.unlock() }
+    func inspect() throws -> GenericVPNPath {
+        lock.lock(); defer { lock.unlock() }
+        guard available else { throw GuardError.invalid("Simulated VPN outage") }
+        return currentPath
+    }
+    func verify() throws -> VPNVerification {
+        let path = try inspect(), now = Date()
+        lock.lock(); let country = self.country; lock.unlock()
+        return VPNVerification(path: path, exit: ExitObservation(address: "1.2.3.4", country: country, checkedAt: now), verifiedAt: now)
+    }
+    func resolve(_ host: String, path: GenericVPNPath) throws -> [String] {
+        if delayResolve { resolveEntered.signal(); _ = releaseResolve.wait(timeout: .now() + 3) }
+        throw GuardError.invalid("No external network in recovery tests")
+    }
+}
+
+private final class DelayedRecoveryMonitor: VPNPathMonitoring, @unchecked Sendable {
+    let path = GenericVPNPath(interface: "utun9999", address: "10.0.0.2", interfaceIndex: 9999)
+    let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), retried = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var calls = 0
+    func inspect() throws -> GenericVPNPath { path }
+    func verify() throws -> VPNVerification {
+        lock.lock(); calls += 1; let first = calls == 1; lock.unlock()
+        guard first else { retried.signal(); throw GuardError.invalid("New verification failed") }
+        entered.signal(); _ = release.wait(timeout: .now() + 5)
+        let now = Date()
+        return VPNVerification(path: path, exit: ExitObservation(address: "1.2.3.4", country: "DE", checkedAt: now), verifiedAt: now)
+    }
+    func resolve(_ host: String, path: GenericVPNPath) throws -> [String] { throw GuardError.invalid("No external network in recovery tests") }
 }

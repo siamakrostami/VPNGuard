@@ -48,3 +48,29 @@ extension ShellIntegrationTests {
         XCTAssertEqual(result.stdout, "READY")
     }
 }
+
+extension ShellIntegrationTests {
+    func testUILaunchUsesChosenFolderAndLiteralRunnerArguments() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let chosen = root.appendingPathComponent("Project with spaces ' and $(literal)")
+        try FileManager.default.createDirectory(at: chosen, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = root.appendingPathComponent("runner ' tool")
+        try Data("#!/bin/sh\npwd -P\nprintf '%s\\n' \"$@\"\n".utf8).write(to: runner)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: runner.path)
+        let rule = UUID(), config = root.appendingPathComponent("a ' b.json").path
+        let script = root.appendingPathComponent("launch.command")
+        try Data(CommandLauncher.script(runner: runner.path, ruleID: rule, config: config, directory: chosen).utf8).write(to: script)
+        let result = try CommandRunner.run("/bin/zsh", ["-f", script.path])
+        XCTAssertEqual(result.status, 0, result.stderr)
+        let lines = result.stdout.components(separatedBy: "\n")
+        let actualFolder = try FileManager.default.attributesOfItem(atPath: lines[0])[.systemFileNumber] as? NSNumber
+        let chosenFolder = try FileManager.default.attributesOfItem(atPath: chosen.path)[.systemFileNumber] as? NSNumber
+        XCTAssertNotNil(actualFolder); XCTAssertEqual(actualFolder, chosenFolder)
+        XCTAssertEqual(Array(lines.dropFirst()), ["--rule", rule.uuidString, "--config", config, "--", ""])
+        try FileManager.default.removeItem(at: chosen)
+        let gone = try CommandRunner.run("/bin/zsh", ["-f", script.path])
+        XCTAssertNotEqual(gone.status, 0)
+        XCTAssertFalse(gone.stdout.contains("--rule"), "A removed folder must never fall back to another directory")
+    }
+}
