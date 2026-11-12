@@ -166,24 +166,31 @@ public enum GuardSection: String, CaseIterable, Identifiable {
         } catch { self.error = error.localizedDescription }
     }
     func setLaunchesEnabled(_ enabled: Bool) { var value = preferences; value.protectionEnabled = enabled; commit(value) }
-    func chooseProject() {
+    @discardableResult
+    func chooseProject(for item: ProtectedItem? = nil) -> URL? {
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.prompt = "Choose Folder"
+        panel.title = item.map { "Launch \($0.name) in a folder" } ?? "Choose a working folder"
+        panel.message = "The protected terminal will start in this folder."
         panel.directoryURL = URL(fileURLWithPath: projectPath)
-        if panel.runModal() == .OK, let url = panel.url { projectPath = url.path; defaults.set(projectPath, forKey: "projectPath") }
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        projectPath = url.path; defaults.set(projectPath, forKey: "projectPath")
+        return url
     }
     func launch(_ item: ProtectedItem) {
         guard item.isEnabled, preferences.protectionEnabled, helperSupported else { error = "Enable the rule and ensure the bundled runner and macOS isolation tool are available."; return }
         if item.kind == .application { pendingDesktopLaunch = item; return }
-        Task { await run(item) }
+        guard let directory = chooseProject(for: item) else { return }
+        Task { await run(item, directory: directory) }
     }
-    func run(_ item: ProtectedItem) async {
+    func run(_ item: ProtectedItem, directory: URL? = nil) async {
+        let workingDirectory = directory ?? URL(fileURLWithPath: projectPath)
         error = nil
         do {
             let folder = store.url.deletingLastPathComponent().appendingPathComponent("Launchers", isDirectory: true)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             if item.kind == .command {
-                let script = folder.appendingPathComponent(item.id.uuidString + ".command")
-                let text = "#!/bin/zsh\ncd -- \(ShellArgument.quote(projectPath)) || exit 1\n\(ShellArgument.quote(runnerPath)) --rule \(ShellArgument.quote(item.id.uuidString)) --config \(ShellArgument.quote(store.url.path)) --\nresult=$?\nif [[ $result -ne 0 ]]; then printf '\\nVPNGuard stopped this launch (status %s).\\n' \"$result\"; fi\nexit $result\n"
+                let script = folder.appendingPathComponent(UUID().uuidString + ".command")
+                let text = CommandLauncher.script(runner: runnerPath, ruleID: item.id, config: store.url.path, directory: workingDirectory)
                 try Data(text.utf8).write(to: script, options: .atomic)
                 try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
                 guard let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else { throw GuardError.invalid("Terminal was not found.") }
@@ -197,7 +204,7 @@ public enum GuardSection: String, CaseIterable, Identifiable {
                 let output = try FileHandle(forWritingTo: log)
                 let process = Process(); process.executableURL = URL(fileURLWithPath: runnerPath)
                 process.arguments = ["--rule", item.id.uuidString, "--config", store.url.path, "--"]
-                process.currentDirectoryURL = URL(fileURLWithPath: projectPath)
+                process.currentDirectoryURL = workingDirectory
                 process.standardInput = FileHandle.nullDevice; process.standardOutput = output; process.standardError = output
                 let id = item.id
                 process.terminationHandler = { [weak self] process in
@@ -215,6 +222,21 @@ public enum GuardSection: String, CaseIterable, Identifiable {
             notice = "The launcher verifies the VPN before starting \(item.name)."
             loadSessions()
         } catch { self.error = error.localizedDescription }
+    }
+    func canReset(_ session: GuardSessionRecord) -> Bool {
+        session.supportsConnectionReset == true && ["running", "blocked"].contains(session.phase)
+            && clock.timeIntervalSince(session.updatedAt) >= 0 && clock.timeIntervalSince(session.updatedAt) < 15
+            && kill(session.processID, 0) == 0
+    }
+    func resetConnections(_ session: GuardSessionRecord) {
+        guard canReset(session) else { error = "This session has ended or uses an older runner. Launch it again with the updated app."; return }
+        do {
+            try SessionConnectionReset.request(sessionID: session.id, storeURL: store.url)
+            notice = "Reset requested for \(session.name). Wait for Running in Activity, then retry your prompt in the terminal."
+        } catch { self.error = error.localizedDescription }
+    }
+    func resetActiveConnections() {
+        for session in sessions where canReset(session) { resetConnections(session) }
     }
     func loadSessions() {
         let folder = store.url.deletingLastPathComponent().appendingPathComponent("Sessions", isDirectory: true)

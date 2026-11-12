@@ -41,6 +41,9 @@ struct GuardWindow: View {
                 .toolbar {
                     ToolbarItemGroup {
                         Button("Verify VPN", systemImage: "arrow.clockwise") { Task { await model.checkVPN() } }.disabled(model.isChecking)
+                        Button("Reset connections", systemImage: "arrow.triangle.2.circlepath") { model.resetActiveConnections() }
+                            .disabled(!model.sessions.contains(where: model.canReset))
+                            .help("Close current protected connections and verify the VPN again. Then retry your prompt.")
                         Button("Add Item", systemImage: "plus") { model.showingAdd = true }.keyboardShortcut("n", modifiers: .command)
                     }
                 }
@@ -109,7 +112,7 @@ struct GuardWindow: View {
                     GroupBox {
                         VStack(alignment: .leading, spacing: 12) {
                             Label("How protection works", systemImage: "lock.shield").font(.headline)
-                            Text("Guarded launches can reach only their private local proxy. The proxy sends traffic through the verified VPN interface and stops when verification is lost.")
+                            Text("Guarded launches can reach only their private local proxy. Connections close when VPN verification is lost and resume only after a fresh check.")
                                 .font(.callout).foregroundStyle(.secondary)
                             Text("Other apps keep their normal connection.").font(.caption.weight(.medium))
                         }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
@@ -190,7 +193,7 @@ struct GuardWindow: View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Launch activity").font(.title2.weight(.semibold))
-                Text("Local records of guarded launches. Traffic contents are never logged.").foregroundStyle(.secondary)
+                Text("Reset connections after reconnecting your VPN, then retry your prompt in the same terminal. Traffic contents are never logged.").foregroundStyle(.secondary)
             }.padding(.horizontal, 26).padding(.top, 26)
             if model.sessions.isEmpty {
                 ContentUnavailableView("No guarded launches yet", systemImage: "waveform.path", description: Text("Launch a protected item or run an integrated command to see its status here."))
@@ -205,6 +208,10 @@ struct GuardWindow: View {
                             Text(session.updatedAt, format: .dateTime.month().day().hour().minute().second()).font(.caption).foregroundStyle(.tertiary)
                         }
                         Spacer()
+                        if model.canReset(session) {
+                            Button("Reset connections", systemImage: "arrow.triangle.2.circlepath") { model.resetConnections(session) }
+                                .help("Verify the VPN again without closing this command or application.")
+                        }
                     }.padding(.vertical, 8)
                 }.listStyle(.inset)
             }
