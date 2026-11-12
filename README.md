@@ -29,7 +29,7 @@ VPNGuard is a native SwiftUI app with a menu-bar companion, zsh command integrat
 
 ```sh
 swift test
-./scripts/build.sh
+zsh scripts/build.sh
 open dist/VPNGuard.app
 ```
 
@@ -39,7 +39,7 @@ To use your own signing identity explicitly:
 
 ```sh
 CODE_SIGN_IDENTITY="Developer ID Application: Your Name (YOURTEAMID)" \
-  VPNGUARD_TIMESTAMP=1 ./scripts/build.sh
+  VPNGUARD_TIMESTAMP=1 zsh scripts/build.sh
 ```
 
 The script creates `dist/VPNGuard.app`. It does not replace an installed copy or edit system VPN/firewall settings. Notarization for public binary distribution is a separate maintainer step; see [release preparation](docs/public/RELEASING.md).

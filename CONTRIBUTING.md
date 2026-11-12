@@ -6,7 +6,7 @@ Keep changes small and explain the trigger, behavior change, validation and rema
 
 ```sh
 swift test
-./scripts/build.sh
+zsh scripts/build.sh
 python3 scripts/public-source.py --check
 ```
 
