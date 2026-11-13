@@ -41,7 +41,13 @@ import VPNGuardCore
         let report = try await perform(preview:false)
         let alert = NSAlert()
         alert.messageText = "VPNGuard uninstall results"
-        alert.informativeText = (["Removed:"] + report.removed + ["\nLeft:"] + report.left + ["\nManual administrator commands (not executed):"] + report.manualCommands).joined(separator:"\n")
+        var lines = ["Removed:"]
+        lines.append(contentsOf: report.removed)
+        lines.append("\nLeft:")
+        lines.append(contentsOf: report.left)
+        lines.append("\nManual administrator commands (not executed):")
+        lines.append(contentsOf: report.manualCommands)
+        alert.informativeText = lines.joined(separator:"\n")
         alert.addButton(withTitle:"Quit VPNGuard")
         alert.runModal()
         NSApp.terminate(nil)
