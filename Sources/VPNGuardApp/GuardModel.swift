@@ -23,12 +23,22 @@ public enum GuardSection: String, CaseIterable, Identifiable {
     var notice: String?
     var clock = Date()
     var showingAdd = false
+    var showingUninstall = false
     var editing: ProtectedItem?
     var pendingRemoval: ProtectedItem?
     var pendingDesktopLaunch: ProtectedItem?
     var sessions: [GuardSessionRecord] = []
     var integrationInstalled = false
     var launchAtLogin = false
+    var connectionSettings = ConnectionSettings()
+    var connectionMode: ConnectionMode = .automatic
+    var proxyKind: UpstreamProxyKind = .socks5
+    var proxyHost = "127.0.0.1"
+    var proxyPort = "10808"
+    var proxyUsername = ""
+    var proxyPassword = ""
+    var useSavedProxyCredentials = true
+    var isSavingConnection = false
     var projectPath: String
     private let store = RuleStore()
     private let integration = CommandIntegration()
@@ -41,6 +51,13 @@ public enum GuardSection: String, CaseIterable, Identifiable {
 
     init() {
         projectPath = UserDefaults.standard.string(forKey: "projectPath") ?? NSHomeDirectory()
+        do {
+            connectionSettings = try ConnectionSettingsStore().load()
+            connectionMode = connectionSettings.mode
+            if let endpoint = connectionSettings.manualProxy {
+                proxyKind = endpoint.kind; proxyHost = endpoint.host; proxyPort = String(endpoint.port)
+            }
+        } catch { self.error = error.localizedDescription }
         do {
             preferences = try store.load()
             if !FileManager.default.fileExists(atPath: store.url.path) {
@@ -69,7 +86,7 @@ public enum GuardSection: String, CaseIterable, Identifiable {
         let age = clock.timeIntervalSince(verification.verifiedAt)
         return age >= 0 && age < 30 && verification.exit.country != "IR"
     }
-    var statusTitle: String { vpnReady ? "VPN verified" : (isChecking ? "Verifying VPN" : "Protected launches blocked") }
+    var statusTitle: String { vpnReady ? "Connection verified" : (isChecking ? "Verifying connection" : "Protected launches blocked") }
     var statusSymbol: String { vpnReady ? "checkmark.shield.fill" : (isChecking ? "arrow.triangle.2.circlepath" : "lock.shield.fill") }
     var statusColor: Color { vpnReady ? .mint : .orange }
     var countryName: String {
@@ -79,11 +96,11 @@ public enum GuardSection: String, CaseIterable, Identifiable {
     var activeSessions: [GuardSessionRecord] {
         sessions.filter { $0.phase == "running" && clock.timeIntervalSince($0.updatedAt) < 15 && kill($0.processID, 0) == 0 }
     }
-    var helperSupported: Bool { FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec") && FileManager.default.isExecutableFile(atPath: runnerPath) }
+    var helperSupported: Bool { FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec") && FileManager.default.isExecutableFile(atPath: runnerPath) && FileManager.default.isExecutableFile(atPath: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/VPNGuardProcessHost").path) }
     func start() {
         guard polling == nil else { return }
-        // Startup was explicitly requested by the user. No privileged helper or account is installed.
-        if preferences.launchAtLogin && !launchAtLogin { setLogin(true) }
+        // Recovery-safe startup only observes registration. Login registration
+        // requires an explicit user action; never restore it just by opening the app.
         clockTask = Task { [weak self] in
             while !Task.isCancelled { self?.clock = Date(); try? await Task.sleep(for: .seconds(1)) }
         }
@@ -109,10 +126,52 @@ public enum GuardSection: String, CaseIterable, Identifiable {
             if verification?.path != path { verification = nil }
             let checked = try await Task.detached(priority: .utility) { try GenericVPNMonitor().verify() }.value
             verification = checked
-            networkMessage = "The tunnel carries internet traffic, and its latest exit check is outside Iran. Each launch verifies again."
+            let transport = checked.path.proxy?.displayName ?? "\(checked.path.interface) · \(checked.path.isIPv6 ? "IPv6" : "IPv4") tunnel"
+            networkMessage = "\(transport). The latest exit check is outside Iran. Each protected launch verifies again."
         } catch {
             verification = nil
             networkMessage = error.localizedDescription
+        }
+    }
+    func saveConnectionSettings() {
+        guard !isSavingConnection else { return }
+        isSavingConnection = true
+        let mode = connectionMode, kind = proxyKind
+        let host = proxyHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let port = proxyPort, username = proxyUsername, password = proxyPassword
+        let previous = connectionSettings, keepCredentials = useSavedProxyCredentials
+        Task {
+            do {
+                let saved = try await Task.detached(priority: .userInitiated) {
+                    var value = previous
+                    value.mode = mode
+                    var createdCredential: String?
+                    do {
+                        if mode == .manualProxy {
+                            guard let number = UInt16(port), number > 0 else { throw GuardError.invalid("Enter a proxy port from 1 to 65535.") }
+                            var endpoint = try UpstreamProxyEndpoint(kind: kind, host: host, port: number)
+                            if !username.isEmpty || !password.isEmpty {
+                                createdCredential = try ProxyCredentialStore.save(username: username, password: password)
+                                endpoint.credentialID = createdCredential
+                            } else if keepCredentials, let old = previous.manualProxy,
+                                      old.kind == kind, old.host.lowercased() == host.lowercased(), old.port == number {
+                                endpoint.credentialID = old.credentialID
+                            }
+                            value.manualProxy = endpoint
+                        }
+                        try ConnectionSettingsStore().save(value)
+                        return value
+                    } catch {
+                        if let createdCredential { try? ProxyCredentialStore.delete(id: createdCredential) }
+                        throw error
+                    }
+                }.value
+                connectionSettings = saved; proxyUsername = ""; proxyPassword = ""; useSavedProxyCredentials = true
+                verification = nil
+                notice = "Connection saved. Existing sessions will pause and verify the new path before sending more traffic."
+                await checkVPN(force: true)
+            } catch { self.error = error.localizedDescription }
+            isSavingConnection = false
         }
     }
     func save(_ item: ProtectedItem) {
@@ -121,10 +180,14 @@ public enum GuardSection: String, CaseIterable, Identifiable {
         commit(updated)
         selectedRule = item.id
     }
-    func toggle(_ item: ProtectedItem, enabled: Bool) { var item = item; item.isEnabled = enabled; save(item) }
+    func toggle(_ item: ProtectedItem, enabled: Bool) {
+        var item = item; item.isEnabled = enabled; save(item)
+        if !enabled { stopSessions(ruleID:item.id) }
+    }
     func remove(_ item: ProtectedItem) {
         var updated = preferences; updated.items.removeAll { $0.id == item.id }; commit(updated)
         if selectedRule == item.id { selectedRule = nil }
+        stopSessions(ruleID:item.id)
     }
     private func commit(_ updated: GuardPreferences) {
         do {
@@ -165,7 +228,19 @@ public enum GuardSection: String, CaseIterable, Identifiable {
             try store.save(updated); preferences = updated
         } catch { self.error = error.localizedDescription }
     }
-    func setLaunchesEnabled(_ enabled: Bool) { var value = preferences; value.protectionEnabled = enabled; commit(value) }
+    func setLaunchesEnabled(_ enabled: Bool) {
+        var value = preferences; value.protectionEnabled = enabled; commit(value)
+        if !enabled { stopSessions() }
+    }
+    func stopSessions(ruleID:UUID? = nil) {
+        loadSessions()
+        let records = sessions.filter { ruleID == nil || $0.ruleID == ruleID }
+        Task.detached(priority:.userInitiated) { SessionLifecycle.terminate(records.compactMap(\.processSession),runners:records.compactMap(\.runnerIdentity)) }
+    }
+    func shutdownSessions() async {
+        loadSessions()
+        await Task.detached(priority:.userInitiated) { SessionShutdown.stopAll() }.value
+    }
     @discardableResult
     func chooseProject(for item: ProtectedItem? = nil) -> URL? {
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.prompt = "Choose Folder"
@@ -249,6 +324,12 @@ public enum GuardSection: String, CaseIterable, Identifiable {
             guard let data = try? Data(contentsOf: url), data.count < 100_000 else { return nil }
             return try? JSONDecoder().decode(GuardSessionRecord.self, from: data)
         }.sorted { $0.updatedAt > $1.updatedAt }
+    }
+    func uninstall() {
+        Task {
+            do { try await AppUninstallCoordinator.inApp() }
+            catch { self.error = "Uninstall stopped: " + error.localizedDescription }
+        }
     }
     func reveal(_ path: String) { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
 }

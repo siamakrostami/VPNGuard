@@ -9,16 +9,25 @@
 ## Launch flow
 
 1. Resolve a rule and refuse disabled/missing policies or executables.
-2. Corroborate routed control destinations on one active IPv4 `utun` interface and identify its unique source address/index.
-3. Perform a pinned HTTPS diagnostic through a socket bound to that interface and address; require a known non-Iran country.
+2. Select an explicit system/manual proxy or corroborate routed control destinations on one active virtual tunnel, choosing one IPv4/IPv6 source and interface index.
+3. Perform diagnostic HTTPS through that exact transport; routed diagnostics use dual binding, proxy diagnostics use explicit libcurl proxy settings with TLS validation and an empty bypass list. Require a known non-Iran country.
 4. Start an authenticated proxy on one random IPv4 loopback port.
 5. Restrict the child and inherited subprocesses to TCP on that exact local endpoint, and supply proxy settings.
-6. Resolve destinations through tunnel-bound HTTPS DNS, then connect through dual-bound sockets.
-7. Watch topology and refresh verification. Close payload sessions on a change/failure or expiry, using an independent freshness watchdog.
+6. Routed traffic resolves A/AAAA through family-matched tunnel-bound HTTPS DNS and uses dual-bound sockets. Proxy traffic delegates destination DNS/CONNECT negotiation to the selected proxy (SOCKS5h/SOCKS4a or HTTP CONNECT). The C libcurl bridge retains outer HTTPS proxy TLS; payload TLS remains opaque.
+7. Watch topology and refresh verification. Revoke the current connection generation and close payload sockets on a change/failure or expiry, using an independent freshness watchdog. Keep the same authenticated listener reserved, denying payload traffic with HTTP 503 until fresh verification succeeds.
+8. While blocked, reverify automatically about every five seconds. A manual reset in Activity sends a private, per-session request consumed by the runner heartbeat and requests an immediate fresh check. A new verification can select a different verified tunnel; stale workers/results cannot attach to the new generation. Final stop closes the listener permanently.
+
+Every command launch from the UI asks for a directory using a native folder picker. It captures that directory in a uniquely named launch script. Cancel does nothing, and a missing directory fails before starting the runner. Shell integration keeps the caller’s working directory.
 
 ## Why the TLS bridge exists
 
 Binding a client only to a local source address is insufficient to establish the required interface restriction on Darwin. The diagnostic and DNS path uses a local byte bridge whose outbound POSIX socket sets both `IP_BOUND_IF` and the verified source address; system curl handles normal TLS hostname/certificate validation over that bridge. Payload TLS is relayed without interception.
+
+## Proxy selection and credentials
+
+Automatic mode prefers explicit system proxy settings, otherwise routed discovery. Explicit system/manual mode never changes to a direct path when unavailable. macOS HTTPSProxy settings normally describe HTTP CONNECT for HTTPS destinations, not TLS-to-proxy. PAC/WPAD-only settings need an explicit manual endpoint. Credential values stay in login Keychain and are passed to libcurl only by the parent broker; settings persist an opaque reference. Changing the endpoint/reference changes the path snapshot and revokes old sessions before re-verification.
+
+The macOS child boundary remains the exact loopback port regardless of upstream family or protocol. SDK libcurl owns upstream proxy descriptors; other threads may shutdown registered descriptors on revoke, while only the worker cleans up libcurl.
 
 ## Local data
 

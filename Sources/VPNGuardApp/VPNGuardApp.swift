@@ -1,7 +1,18 @@
 import SwiftUI
 import AppKit
 
-@main struct VPNGuardApp: App {
+@main enum VPNGuardEntry {
+    @MainActor static func main() async {
+        if CommandLine.arguments.contains("--uninstall") {
+            let code = await AppUninstallCoordinator.commandLine(preview:CommandLine.arguments.contains("--preview"))
+            exit(code)
+        }
+        VPNGuardApp.main()
+    }
+}
+
+struct VPNGuardApp: App {
+    @NSApplicationDelegateAdaptor(GuardAppDelegate.self) private var appDelegate
     @State private var model = GuardModel()
     var body: some Scene {
         Window("VPNGuard", id: "main") { GuardWindow(model: model) }

@@ -10,6 +10,18 @@ final class TransportTests: XCTestCase {
             XCTAssertThrowsError(try ConnectRequest.parse(Data(input.utf8)), input)
         }
     }
+    func testNumericIPv4AliasesCannotReachLocalServicesThroughProxy() {
+        for host in ["127.1","127.0.01","0x7f.1","0177.0.0.1","2130706433"] {
+            XCTAssertThrowsError(try ConnectRequest.parse(Data("CONNECT \(host):443 HTTP/1.1\r\n\r\n".utf8)),host)
+        }
+    }
+    func testPublicIPv6ConnectAuthorityIsAcceptedWithoutPrivateLiterals() throws {
+        let r = try ConnectRequest.parse(Data("CONNECT [2606:4700:4700::1111]:443 HTTP/1.1\r\nHost: [2606:4700:4700::1111]:443\r\n\r\n".utf8))
+        XCTAssertEqual(r.host,"2606:4700:4700::1111")
+        for host in ["::1","::","fe80::1","fc00::1","::ffff:127.0.0.1"] {
+            XCTAssertThrowsError(try ConnectRequest.parse(Data("CONNECT [\(host)]:443 HTTP/1.1\r\n\r\n".utf8)))
+        }
+    }
     func testRouteSelectionRejectsAmbiguityAndPhysicalRoute() throws {
         let good = "interface: utun4\n"
         XCTAssertEqual(try TransportParsing.path(routes: [good, good], interfaceText: "utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST>\n inet 10.7.0.2 --> 10.7.0.1 netmask 0xffffffff\n", index: 9).interfaceIndex, 9)
@@ -84,6 +96,35 @@ final class TransportTests: XCTestCase {
         XCTAssertNotEqual(denied.status, 0)
         print("Live transport verified: \(verification.path.interface), non-Iran country \(verification.exit.country); dual binding, DoH, CONNECT and stop denial passed.")
     }
+    func testLiveSelectedHTTPUpstreamAndRecovery() throws {
+        guard ProcessInfo.processInfo.environment["VPNGUARD_LIVE_TRANSPORT_TESTS"] == "1" else { throw XCTSkip("Opt-in live proxy-path diagnostic") }
+        // A second guarded broker is a real authenticated HTTP upstream. No user
+        // connection settings are changed; its sockets stay bound to the live tunnel.
+        let routed = GenericVPNMonitor()
+        let inner = VPNBoundProxy(verification:try routed.verify(),monitor:routed,onEvent:{_ in})
+        let innerInfo = try inner.start();defer{inner.stop()}
+        let url = try XCTUnwrap(URLComponents(string:innerInfo.proxyURL))
+        let credential = try ProxyCredentialStore.save(username:try XCTUnwrap(url.user),password:try XCTUnwrap(url.password))
+        defer { try? ProxyCredentialStore.delete(id:credential) }
+        let endpoint = try UpstreamProxyEndpoint(kind:.http,host:"127.0.0.1",port:innerInfo.port,credentialID:credential)
+        let selected = LiveProxyMonitor(endpoint:endpoint)
+        let verification = try selected.verify()
+        XCTAssertNotEqual(verification.exit.country,"IR")
+        let outer = VPNBoundProxy(verification:verification,monitoring:selected,onEvent:{_ in})
+        let info = try outer.start();defer{outer.stop()}
+        func request() throws -> CommandOutput {
+            try CommandRunner.run("/usr/bin/curl",["--disable","--proxy",info.proxyURL,"--noproxy","","--fail","--silent","--show-error","--max-time","15","https://www.cloudflare.com/cdn-cgi/trace"],timeout:17)
+        }
+        XCTAssertEqual(try request().status,0)
+        outer.resetConnections()
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline && (try? proxyResponse(port:info.port)) != "HTTP/1.1 407 Proxy Authentication Required" { Thread.sleep(forTimeInterval:0.1) }
+        XCTAssertEqual(try request().status,0,"Selected upstream must recover using the same child endpoint")
+        inner.stop()
+        outer.resetConnections()
+        XCTAssertNotEqual(try request().status,0,"An unavailable selected proxy must never fall back to the still-working routed VPN")
+    }
+
     func testOutageRecoveryKeepsTheExistingProxyEndpoint() throws {
         let monitor = RecoveringTransportMonitor()
         let proxy = VPNBoundProxy(verification: try monitor.verify(), monitoring: monitor, onEvent: { _ in })
@@ -272,4 +313,14 @@ private final class DelayedRecoveryMonitor: VPNPathMonitoring, @unchecked Sendab
         return VPNVerification(path: path, exit: ExitObservation(address: "1.2.3.4", country: "DE", checkedAt: now), verifiedAt: now)
     }
     func resolve(_ host: String, path: GenericVPNPath) throws -> [String] { throw GuardError.invalid("No external network in recovery tests") }
+}
+
+private struct LiveProxyMonitor: VPNPathMonitoring {
+    let endpoint:UpstreamProxyEndpoint
+    func inspect() throws -> GenericVPNPath { GenericVPNPath(interface:"proxy",address:"",interfaceIndex:0,proxy:endpoint) }
+    func verify() throws -> VPNVerification {
+        let body = try UpstreamProxyChannel.fetchTrace(endpoint:endpoint), now = Date()
+        return VPNVerification(path:try inspect(),exit:try ExitObservation.parse(body,at:now),verifiedAt:now)
+    }
+    func resolve(_ host:String,path:GenericVPNPath)throws->[String] { throw GuardError.invalid("Proxy destinations must not resolve locally") }
 }

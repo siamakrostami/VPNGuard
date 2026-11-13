@@ -40,7 +40,7 @@ struct GuardWindow: View {
                 .navigationTitle(model.section.rawValue)
                 .toolbar {
                     ToolbarItemGroup {
-                        Button("Verify VPN", systemImage: "arrow.clockwise") { Task { await model.checkVPN() } }.disabled(model.isChecking)
+                        Button("Verify connection", systemImage: "arrow.clockwise") { Task { await model.checkVPN() } }.disabled(model.isChecking)
                         Button("Reset connections", systemImage: "arrow.triangle.2.circlepath") { model.resetActiveConnections() }
                             .disabled(!model.sessions.contains(where: model.canReset))
                             .help("Close current protected connections and verify the VPN again. Then retry your prompt.")
@@ -57,7 +57,7 @@ struct GuardWindow: View {
             }
             Button("Cancel", role: .cancel) { model.pendingRemoval = nil }
         } message: {
-            Text("New launches will no longer be guarded by this rule. Existing guarded sessions keep their restrictions. Open a new Terminal window after changing command rules.")
+            Text("New launches will no longer be guarded by this rule. Existing sessions for this rule will be resumed if needed and terminated. Open a new Terminal window after changing command rules.")
         }
         .alert("Launch an app with network isolation?", isPresented: Binding(get: { model.pendingDesktopLaunch != nil }, set: { if !$0 { model.pendingDesktopLaunch = nil } })) {
             Button("Cancel", role: .cancel) { model.pendingDesktopLaunch = nil }
@@ -66,6 +66,12 @@ struct GuardWindow: View {
             }
         } message: {
             Text("Quit any existing instance first. Direct sockets and inherited child processes are restricted. Apps that hand work to independent background services may need additional validation; VPNGuard cannot intercept normal Finder launches.")
+        }
+        .confirmationDialog("Uninstall VPNGuard?",isPresented:$model.showingUninstall,titleVisibility:.visible) {
+            Button("Stop sessions and uninstall",role:.destructive) { model.uninstall() }
+            Button("Cancel",role:.cancel) {}
+        } message: {
+            Text("Protected commands and applications will be terminated. VPNGuard’s login/background registration and recognized local files will be removed. Other VPN software will not be changed.")
         }
         .task { model.start() }
     }
@@ -83,7 +89,7 @@ struct GuardWindow: View {
                 }.padding(.vertical, 8)
                 HStack(spacing: 16) {
                     metric("Exit country", value: model.countryName, symbol: "globe.europe.africa")
-                    metric("Public IPv4", value: model.vpnReady ? (model.verification?.exit.address ?? "Not verified") : "Not verified", symbol: "network")
+                    metric("Public IP", value: model.vpnReady ? (model.verification?.exit.address ?? "Not verified") : "Not verified", symbol: "network")
                     metric("Guarded sessions", value: "\(model.activeSessions.count)", symbol: "terminal")
                 }
                 GroupBox {
@@ -221,11 +227,50 @@ struct GuardWindow: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 Text("Settings").font(.title.weight(.semibold))
+                GroupBox("Protected connection") {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Picker("Connection", selection: $model.connectionMode) {
+                            ForEach(ConnectionMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
+                        }
+                        Text("Automatic uses an explicit system HTTP or SOCKS proxy when enabled, otherwise a routed IPv4 or IPv6 tunnel. System proxy mode never falls back to a direct route.")
+                            .font(.callout).foregroundStyle(.secondary)
+                        if model.connectionMode == .manualProxy {
+                            Picker("Proxy protocol", selection: $model.proxyKind) {
+                                Text("HTTP CONNECT").tag(UpstreamProxyKind.http)
+                                Text("HTTPS CONNECT (TLS to proxy)").tag(UpstreamProxyKind.https)
+                                Text("SOCKS5 (remote DNS)").tag(UpstreamProxyKind.socks5)
+                                Text("SOCKS4a (remote DNS)").tag(UpstreamProxyKind.socks4a)
+                            }
+                            HStack {
+                                TextField("Host", text: $model.proxyHost).textContentType(.URL)
+                                TextField("Port", text: $model.proxyPort).frame(width: 100)
+                            }
+                            Text("For V2Ray/Xray clients, use the local HTTP, SOCKS or mixed listening endpoint shown in that client. A router proxy can use its LAN address. Remote subscription links and VMess/VLESS URLs are not proxy endpoints.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            HStack {
+                                TextField("Proxy username (optional)", text: $model.proxyUsername)
+                                SecureField("Proxy password (optional)", text: $model.proxyPassword)
+                            }
+                            if model.connectionSettings.manualProxy?.credentialID != nil {
+                                Toggle("Use saved credentials for the same endpoint", isOn: $model.useSavedProxyCredentials)
+                            }
+                            Text("Credentials are stored in macOS Keychain. New credentials replace the saved reference. SOCKS4a uses a username only; it has no password authentication.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        HStack {
+                            Button("Save and verify", systemImage: "checkmark.shield") { model.saveConnectionSettings() }
+                                .buttonStyle(.borderedProminent).tint(.teal).disabled(model.isSavingConnection)
+                            if model.isSavingConnection { ProgressView().controlSize(.small) }
+                        }
+                        Text("V2Ray/Xray through a proxy; L2TP, WireGuard, OpenVPN and other routed VPNs through a recognized tunnel. Product and configuration compatibility still needs validation. PAC/WPAD-only setups need a manual endpoint.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }.padding(12)
+                }
                 GroupBox("Startup and launches") {
                     VStack(alignment: .leading, spacing: 16) {
                         Toggle("Open VPNGuard at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLogin($0) }))
-                        Toggle("Allow protected launches", isOn: Binding(get: { model.preferences.protectionEnabled }, set: { model.setLaunchesEnabled($0) }))
-                        Text("Turning launches off stops new guarded launches. It does not silently run commands without protection.").font(.caption).foregroundStyle(.secondary)
+                        Toggle("Protection enabled", isOn: Binding(get: { model.preferences.protectionEnabled }, set: { model.setLaunchesEnabled($0) }))
+                        Text("Turning protection off terminates active protected sessions and blocks new launches. It does not run commands without protection.").font(.caption).foregroundStyle(.secondary)
                     }.padding(12)
                 }
                 GroupBox("Terminal command integration") {
@@ -249,12 +294,19 @@ struct GuardWindow: View {
                         Button("Choose…") { model.chooseProject() }
                     }.padding(12)
                 }
+                GroupBox("Uninstall VPNGuard") {
+                    VStack(alignment:.leading,spacing:12) {
+                        Text("Stops protected sessions, unregisters this app’s login item and legacy helper, and removes recognized VPNGuard shell integration and local data. Edited or unrecognized files are left and reported. Root-owned leftovers need manual administrator cleanup.")
+                            .font(.callout).foregroundStyle(.secondary)
+                        Button("Uninstall VPNGuard…",role:.destructive) { model.showingUninstall = true }
+                    }.padding(12)
+                }
                 GroupBox("Security boundary") {
                     VStack(alignment: .leading, spacing: 10) {
                         Label("No administrator helper required", systemImage: "person.badge.shield.checkmark").font(.headline)
-                        Text("This version uses macOS process isolation and a VPN-bound proxy. It supports compatible IPv4 tunnel VPNs; proxy-only connections and unverified split routes stay blocked.")
+                        Text("Protected processes use one private proxy. Its upstream is a verified routed IPv4/IPv6 tunnel or an explicitly selected HTTP/HTTPS/SOCKS proxy. Failed verification blocks traffic; it never falls back direct.")
                         Text("Desktop apps must launch here. Independent background services and app self-relaunch behavior are not universally covered. App compatibility needs individual validation.")
-                        Text("HTTPS and secure WebSockets through HTTP CONNECT are supported. Plain HTTP, direct TCP, UDP/QUIC and IPv6 are blocked.")
+                        Text("HTTPS and secure WebSockets through HTTP CONNECT are supported. Direct child sockets, plain HTTP and UDP/QUIC remain blocked. Routed traffic uses only its verified address family.")
                         Text("The isolation tool is deprecated by Apple. If it is missing or stops working, guarded launches fail instead of running normally.")
                         Text("Exit location is a periodic external report. It cannot guarantee how a service classifies an IP address.")
                     }.font(.callout).foregroundStyle(.secondary).padding(12)

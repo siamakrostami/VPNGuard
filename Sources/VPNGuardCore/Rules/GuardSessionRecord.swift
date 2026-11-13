@@ -9,6 +9,8 @@ public struct GuardSessionRecord: Identifiable, Codable, Sendable {
     public var startedAt: Date
     public var updatedAt: Date
     public var phase: String
+    public var runnerIdentity: ProcessIdentity?
+    public var processSession: ProcessSessionIdentity?
     public var supportsConnectionReset: Bool?
     public var message: String
     public init(id: UUID = UUID(), ruleID: UUID, name: String, processID: Int32 = getpid(), phase: String, message: String) {

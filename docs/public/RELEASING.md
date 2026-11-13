@@ -17,6 +17,12 @@
 
 Do not upload `.build`, generated `.app` bundles, `Previous`, local developer notes, inspection JSON, logs, user configuration, signing material or the retired single-VPN helper. The source allowlist is narrower than the original working directory.
 
+## Automated builds
+
+The `macOS checks and downloads` workflow tests/builds on Apple Silicon (`macos-15`) and Intel (`macos-15-intel`). Successful runs package app ZIPs and SHA-256 files as 30-day Actions artifacts. Select the architecture-specific artifact, extract the outer artifact archive, then extract the inner app ZIP. GitHub may require sign-in for Actions downloads.
+
+The workflow has read-only repository contents permission. It runs on main pushes, pull requests, published releases, and manual dispatch. It does not upload private local build folders or use signing secrets. A configured workflow is not a completed build; link only verified successful artifacts. macOS runner labels follow GitHub's [runner documentation](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
 ## Downloadable binary
 
 A default local build uses an ad-hoc signature. It is useful for a person building the source on their own Mac; it is not a normal Gatekeeper-ready public app release.

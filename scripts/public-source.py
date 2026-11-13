@@ -9,7 +9,7 @@ import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TOP = {"Package.swift", "README.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md", "CHANGELOG.md", ".gitignore"}
-TREES = {"Sources": {".swift"}, "Tests": {".swift"}, "Packaging": {".plist"}, "scripts": {".sh", ".swift", ".py"}, ".github": {".yml", ".yaml", ".md"}, "docs/public": {".md"}}
+TREES = {"Sources": {".swift", ".c", ".h"}, "Tests": {".swift"}, "Packaging": {".plist"}, "scripts": {".sh", ".swift", ".py"}, ".github": {".yml", ".yaml", ".md"}, "docs/public": {".md"}}
 
 
 def files() -> list[pathlib.Path]:
@@ -43,7 +43,10 @@ def audit(paths: list[pathlib.Path]) -> None:
         for match in re.finditer(r"/" + r"Users/([^/\s\"']+)", text):
             if match.group(1) not in {"you", "test", "example"}:
                 issues.append(f"{rel}: machine-specific home path")
-        if rel.startswith("Sources/") and any(x in text for x in ["ownerUID", "teamID =", "OpenVPNConnect.framework", "com.siamak.VPNGuard.helper"]):
+        retired_markers = ["ownerUID", "teamID =", "OpenVPNConnect.framework"]
+        if rel != "Sources/VPNGuardApp/AppUninstallCoordinator.swift":
+            retired_markers.append("com.siamak.VPNGuard.helper")
+        if rel.startswith("Sources/") and any(x in text for x in retired_markers):
             issues.append(f"{rel}: retired helper or personal account binding")
     if issues:
         raise ValueError("Public-source audit failed:\n" + "\n".join(issues))

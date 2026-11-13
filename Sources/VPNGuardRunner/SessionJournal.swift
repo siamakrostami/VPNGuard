@@ -14,6 +14,7 @@ final class SessionJournal: @unchecked Sendable {
     init(rule: ProtectedItem, storeURL: URL) throws {
         self.storeURL = storeURL
         record = GuardSessionRecord(ruleID: rule.id, name: rule.name, phase: "checking", message: "Checking VPN route and non-Iran exit.")
+        record.runnerIdentity = ProcessIdentity.capture(getpid())
         record.supportsConnectionReset = true
         let folder = storeURL.deletingLastPathComponent().appendingPathComponent("Sessions", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -25,12 +26,16 @@ final class SessionJournal: @unchecked Sendable {
         self.timer = timer; timer.resume()
     }
     deinit { timer?.cancel() }
+    func setProcessIdentity(_ value: ProcessSessionIdentity) {
+        lock.lock(); defer { lock.unlock() }
+        record.processSession = value; record.updatedAt = Date(); try? save()
+    }
     func setResetHandler(_ handler: @escaping @Sendable () -> Void) {
         lock.lock(); resetHandler = handler; lock.unlock()
     }
     func update(phase: String, message: String) {
         lock.lock(); defer { lock.unlock() }
-        guard record.phase != "ended" else { return }
+        guard record.phase != "ended", record.phase != "ending" || phase == "ended" else { return }
         record.phase = phase; record.message = message; record.updatedAt = Date()
         try? save()
         if phase == "ended" { timer?.cancel(); timer = nil }

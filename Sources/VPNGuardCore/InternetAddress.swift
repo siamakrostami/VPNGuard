@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public enum GuardError: LocalizedError, Sendable {
     case invalid(String)
@@ -12,6 +13,12 @@ public enum IPv4 {
             !$0.isEmpty && $0.allSatisfy(\.isASCII) && $0.allSatisfy(\.isNumber)
                 && ($0.count == 1 || !$0.hasPrefix("0")) && UInt8($0) != nil
         }
+    }
+    /// libc/libcurl recognize legacy abbreviated, octal, hex and integer literals.
+    /// Never let those spellings enter the hostname path and bypass literal checks.
+    public static func isLegacyAlias(_ value: String) -> Bool {
+        var address = in_addr()
+        return value.withCString { inet_aton($0, &address) } == 1 && !isValid(value)
     }
     public static func isPublic(_ value: String) -> Bool {
         guard isValid(value) else { return false }
@@ -27,6 +34,30 @@ public enum IPv4 {
     }
 }
 
+public enum IPv6 {
+    private static func bytes(_ value: String) -> [UInt8]? {
+        guard !value.contains("%"), !value.contains("."), !value.contains(where: { $0.isWhitespace }) else { return nil }
+        var address = in6_addr()
+        guard value.withCString({ inet_pton(AF_INET6, $0, &address) }) == 1 else { return nil }
+        return withUnsafeBytes(of: address) { Array($0) }
+    }
+    public static func isValid(_ value: String) -> Bool { bytes(value) != nil }
+    public static func isPublic(_ value: String) -> Bool {
+        guard let b = bytes(value), b[0] & 0xe0 == 0x20 else { return false }
+        // IETF special assignments, documentation, and transition mechanisms
+        // cannot carry arbitrary public destinations through this transport.
+        if b[0] == 0x20 && b[1] == 0x01 && b[2] < 2 { return false }
+        if b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0d && b[3] == 0xb8 { return false }
+        if b[0] == 0x20 && b[1] == 0x02 { return false }
+        if b[0] == 0x3f && b[1] == 0xff && b[2] & 0xf0 == 0 { return false }
+        return true
+    }
+    static func isUsableSource(_ value: String) -> Bool {
+        guard let b = bytes(value) else { return false }
+        return isPublic(value) || b[0] & 0xfe == 0xfc
+    }
+}
+
 public struct ExitObservation: Codable, Equatable, Sendable {
     public let address: String
     public let country: String
@@ -39,8 +70,8 @@ public struct ExitObservation: Codable, Equatable, Sendable {
             guard fields[pair[0]] == nil else { throw GuardError.invalid("Ambiguous exit-location response.") }
             fields[pair[0]] = pair[1]
         }
-        guard let ip = fields["ip"], IPv4.isPublic(ip), let country = fields["loc"],
-              Locale.isoRegionCodes.contains(country), country != "IR" else {
+        guard let ip = fields["ip"], (IPv4.isPublic(ip) || IPv6.isPublic(ip)), let country = fields["loc"],
+              Locale.Region.isoRegions.contains(where: { $0.identifier == country }), country != "IR" else {
             throw GuardError.invalid("The VPN exit is Iran or its location could not be verified.")
         }
         return Self(address: ip, country: country, checkedAt: time)

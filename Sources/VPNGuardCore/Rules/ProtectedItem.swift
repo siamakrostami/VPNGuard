@@ -38,7 +38,7 @@ public struct GuardPreferences: Codable, Sendable {
     public var version = 2
     public var items: [ProtectedItem] = []
     public var protectionEnabled = true
-    public var launchAtLogin = true
+    public var launchAtLogin = false
     public init() {}
     public static func validate(items: [ProtectedItem]) throws {
         guard items.count <= 200 else { throw GuardError.invalid("This version supports up to 200 protected items.") }
